@@ -15,7 +15,7 @@ import shutil
 import sys
 import tempfile
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiogram import BaseMiddleware, Bot, Dispatcher, types, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -78,6 +78,7 @@ class SessionStates(StatesGroup):
     waiting_for_json = State()
     waiting_for_2fa = State()
     waiting_for_admin_id = State()
+    waiting_for_admin_days = State()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
@@ -165,14 +166,78 @@ def load_admins():
     try:
         with open(ADMINS_FILE, "r", encoding="utf-8") as file:
             data = json.load(file)
-            return [int(admin_id) for admin_id in data.get("admins", [])]
+            admins = data.get("admins", [])
+            if admins and isinstance(admins[0], int):
+                return [
+                    {
+                        "id": int(admin_id),
+                        "expires_at": None,
+                        "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                    for admin_id in admins
+                ]
+
+            return [
+                {
+                    "id": int(item["id"]),
+                    "expires_at": item.get("expires_at"),
+                    "added_at": item.get("added_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                for item in admins
+                if int(item.get("id", 0)) != OWNER_ID
+            ]
     except (json.JSONDecodeError, OSError, ValueError):
         return []
 
-def save_admins(admins: list[int]):
-    clean_admins = sorted({int(admin_id) for admin_id in admins if int(admin_id) != OWNER_ID})
+def save_admins(admins: list[dict]):
+    clean_admins = []
+    seen = set()
+    for item in admins:
+        admin_id = int(item["id"])
+        if admin_id == OWNER_ID or admin_id in seen:
+            continue
+        seen.add(admin_id)
+        clean_admins.append({
+            "id": admin_id,
+            "expires_at": item.get("expires_at"),
+            "added_at": item.get("added_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    clean_admins.sort(key=lambda item: item["id"])
     with open(ADMINS_FILE, "w", encoding="utf-8") as file:
         json.dump({"admins": clean_admins}, file, ensure_ascii=False, indent=2)
+
+def parse_admin_expire(expires_at: str | None):
+    if not expires_at:
+        return None
+    return datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
+
+def is_admin_active(admin: dict):
+    expires_at = parse_admin_expire(admin.get("expires_at"))
+    return expires_at is None or expires_at > datetime.now()
+
+def cleanup_expired_admins():
+    admins = load_admins()
+    active_admins = [admin for admin in admins if is_admin_active(admin)]
+    if len(active_admins) != len(admins):
+        save_admins(active_admins)
+    return active_admins
+
+def get_admin_label(admin: dict):
+    expires_at = admin.get("expires_at")
+    if expires_at:
+        return f"{admin['id']} | до {expires_at}"
+    return f"{admin['id']} | навсегда"
+
+def build_admin_entry(admin_id: int, days: int):
+    expires_at = None
+    if days > 0:
+        expires_at = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+
+    return {
+        "id": int(admin_id),
+        "expires_at": expires_at,
+        "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
 def is_owner(user_id: int | None):
     return user_id == OWNER_ID
@@ -180,7 +245,7 @@ def is_owner(user_id: int | None):
 def is_admin(user_id: int | None):
     if user_id is None:
         return False
-    return is_owner(user_id) or int(user_id) in load_admins()
+    return is_owner(user_id) or any(admin["id"] == int(user_id) for admin in cleanup_expired_admins())
 
 class AccessMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
@@ -607,7 +672,7 @@ async def cmd_admins(message: types.Message):
     await show_admins_menu(message)
 
 async def show_admins_menu(message: types.Message, is_edit: bool = False):
-    admins = load_admins()
+    admins = cleanup_expired_admins()
     builder = InlineKeyboardBuilder()
     builder.row(types.InlineKeyboardButton(text="Добавить админа", callback_data="admin_add"))
     if admins:
@@ -616,7 +681,7 @@ async def show_admins_menu(message: types.Message, is_edit: bool = False):
 
     lines = [f"Владелец: {OWNER_ID}", "", "Админы:"]
     if admins:
-        lines.extend(str(admin_id) for admin_id in admins)
+        lines.extend(get_admin_label(admin) for admin in admins)
     else:
         lines.append("пока нет")
 
@@ -655,13 +720,36 @@ async def process_admin_id(message: types.Message, state: FSMContext):
         await show_admins_menu(message)
         return
 
-    admins = load_admins()
-    if admin_id not in admins:
-        admins.append(admin_id)
-        save_admins(admins)
+    await state.update_data(new_admin_id=admin_id)
+    await state.set_state(SessionStates.waiting_for_admin_days)
+    await message.answer("На сколько дней выдать доступ? Отправьте число. 0 значит навсегда.")
+
+@router.message(SessionStates.waiting_for_admin_days)
+async def process_admin_days(message: types.Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await message.answer("Только владелец может добавлять админов.")
+        await state.clear()
+        return
+
+    try:
+        days = int(message.text.strip())
+    except (ValueError, AttributeError):
+        await message.answer("Отправьте число дней. 0 значит навсегда.")
+        return
+
+    if days < 0:
+        await message.answer("Срок не может быть отрицательным. 0 значит навсегда.")
+        return
+
+    data = await state.get_data()
+    admin_id = int(data["new_admin_id"])
+    admins = [admin for admin in cleanup_expired_admins() if admin["id"] != admin_id]
+    entry = build_admin_entry(admin_id, days)
+    admins.append(entry)
+    save_admins(admins)
 
     await state.clear()
-    await message.answer(f"Админ добавлен: {admin_id}")
+    await message.answer(f"Админ добавлен: {get_admin_label(entry)}")
     await show_admins_menu(message)
 
 @router.callback_query(F.data == "admin_remove_menu")
@@ -670,10 +758,10 @@ async def action_admin_remove_menu(callback: types.CallbackQuery):
         await callback.answer("Только владелец", show_alert=True)
         return
 
-    admins = load_admins()
+    admins = cleanup_expired_admins()
     builder = InlineKeyboardBuilder()
-    for admin_id in admins:
-        builder.row(types.InlineKeyboardButton(text=str(admin_id), callback_data=f"admin_remove:{admin_id}"))
+    for admin in admins:
+        builder.row(types.InlineKeyboardButton(text=get_admin_label(admin), callback_data=f"admin_remove:{admin['id']}"))
     builder.row(types.InlineKeyboardButton(text="Назад", callback_data="admins_menu"))
     await callback.message.edit_text("Выберите админа для удаления:", reply_markup=builder.as_markup())
 
@@ -684,7 +772,7 @@ async def action_admin_remove(callback: types.CallbackQuery):
         return
 
     admin_id = int(callback.data.split(":")[1])
-    admins = [item for item in load_admins() if item != admin_id]
+    admins = [item for item in cleanup_expired_admins() if item["id"] != admin_id]
     save_admins(admins)
     await callback.answer("Админ удален")
     await show_admins_menu(callback.message, is_edit=True)
