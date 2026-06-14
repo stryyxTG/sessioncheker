@@ -3,6 +3,5 @@ __pycache__/
 *.pyc
 sessions/
 admins.json
-config.local.json
 
 *.log
