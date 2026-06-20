@@ -75,6 +75,7 @@ dp.include_router(router)
 class SessionStates(StatesGroup):
     waiting_for_file = State()
     waiting_for_bulk_tdata = State()
+    waiting_for_bulk_sessions = State()
     waiting_for_json = State()
     waiting_for_2fa = State()
     waiting_for_admin_id = State()
@@ -555,7 +556,7 @@ async def convert_session_to_tdata(session_name: str):
     if not user_id:
         raise RuntimeError("Для пассивной обратной конвертации нужен user_id в истории. Нажмите 'Обновить номер', потом повторите.")
 
-    base_name = sanitize_filename(os.path.splitext(os.path.basename(session_name))[0])
+    base_name = sanitize_filename(info.get("source_base") or os.path.splitext(os.path.basename(session_name))[0])
     session_path = os.path.join(SESSION_DIR, session_name)
     tdata_dir_name = f"{base_name}_tdata"
     tdata_dir = os.path.join(SESSION_DIR, tdata_dir_name)
@@ -578,6 +579,19 @@ async def convert_session_to_tdata(session_name: str):
         "phone": info.get("phone"),
         "user_id": user_id,
     }
+
+async def convert_session_account_to_tdata(session_name: str):
+    history = load_history()
+    current = history.get(session_name, {})
+
+    if not current.get("user_id"):
+        info = await get_account_info(os.path.join(SESSION_DIR, session_name), "telethon")
+        info["source_base"] = current.get("source_base") or os.path.splitext(os.path.basename(session_name))[0]
+        update_history(session_name, info)
+
+    result = await convert_session_to_tdata(session_name)
+    result["session_name"] = session_name
+    return result
 
 async def remember_account(session_name: str):
     path = os.path.join(SESSION_DIR, session_name)
@@ -825,6 +839,7 @@ async def add_session_menu(callback: types.CallbackQuery):
     builder.row(types.InlineKeyboardButton(text="Pyrogram (.session)", callback_data="add_type_pyrogram"))
     builder.row(types.InlineKeyboardButton(text="Telegram Desktop tdata (.zip)", callback_data="add_type_tdata"))
     builder.row(types.InlineKeyboardButton(text="Массовая tdata (.zip)", callback_data="add_type_bulk_tdata"))
+    builder.row(types.InlineKeyboardButton(text="Массовые Telethon (.session)", callback_data="add_type_bulk_sessions"))
     builder.row(types.InlineKeyboardButton(text="JSON / String", callback_data="add_type_json"))
     builder.row(types.InlineKeyboardButton(text="Назад", callback_data="back_to_main"))
     
@@ -854,6 +869,22 @@ async def process_add_type(callback: types.CallbackQuery, state: FSMContext):
             reply_markup=builder.as_markup()
         )
         await state.set_state(SessionStates.waiting_for_bulk_tdata)
+    elif session_type == "bulk_sessions":
+        batch_id = f"bulk_sessions_{callback.from_user.id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        await state.update_data(
+            batch_id=batch_id,
+            bulk_items=[],
+            bulk_errors=[],
+            created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        builder = InlineKeyboardBuilder()
+        builder.row(types.InlineKeyboardButton(text="Анализ и конвертация", callback_data=f"finish_bulk_sessions:{batch_id}"))
+        builder.row(types.InlineKeyboardButton(text="Отмена", callback_data="back_to_main"))
+        await callback.message.answer(
+            "Кидайте Telethon .session файлы. После загрузки нажмите анализ и конвертацию.",
+            reply_markup=builder.as_markup()
+        )
+        await state.set_state(SessionStates.waiting_for_bulk_sessions)
     elif session_type == "tdata":
         await callback.message.answer("Отправьте .zip архив с папкой tdata или ее содержимым:")
         await state.set_state(SessionStates.waiting_for_file)
@@ -940,6 +971,44 @@ async def handle_bulk_tdata_file(message: types.Message, state: FSMContext):
     builder.row(types.InlineKeyboardButton(text="Отмена", callback_data="back_to_main"))
     await message.answer(
         f"Добавлено в пачку: {len(items)}\nОшибок при загрузке: {len(errors)}",
+        reply_markup=builder.as_markup()
+    )
+
+@router.message(SessionStates.waiting_for_bulk_sessions, F.document)
+async def handle_bulk_session_file(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    batch_id = data.get("batch_id")
+    items = data.get("bulk_items", [])
+    errors = data.get("bulk_errors", [])
+    original_name = message.document.file_name
+
+    if not original_name.lower().endswith(".session"):
+        errors.append({"file": original_name, "error": "не .session файл"})
+        await state.update_data(bulk_errors=errors)
+        await message.answer("Пропустил файл: нужен Telethon .session")
+        return
+
+    source_base = sanitize_filename(os.path.splitext(original_name)[0])
+    session_name = f"telethon_{batch_id}_{len(items) + 1}_{source_base}.session"
+    session_path = os.path.join(SESSION_DIR, session_name)
+
+    try:
+        file = await bot.get_file(message.document.file_id)
+        await bot.download_file(file.file_path, session_path)
+        update_history(session_name, {"source_base": source_base})
+        items.append(session_name)
+        await state.update_data(bulk_items=items)
+    except Exception as e:
+        errors.append({"file": original_name, "error": str(e)})
+        await state.update_data(bulk_errors=errors)
+        await message.answer(f"Не удалось добавить {original_name}: {e}")
+        return
+
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="Анализ и конвертация", callback_data=f"finish_bulk_sessions:{batch_id}"))
+    builder.row(types.InlineKeyboardButton(text="Отмена", callback_data="back_to_main"))
+    await message.answer(
+        f"Добавлено .session: {len(items)}\nОшибок при загрузке: {len(errors)}",
         reply_markup=builder.as_markup()
     )
 
@@ -1221,6 +1290,92 @@ async def action_get_bulk_sessions(callback: types.CallbackQuery):
             )
 
     await callback.message.answer("Готовые файлы отправлены.")
+
+@router.callback_query(F.data.startswith("finish_bulk_sessions:"))
+async def action_finish_bulk_sessions(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    batch_id = callback.data.split(":", 1)[1]
+
+    if data.get("batch_id") != batch_id:
+        await callback.answer("Пачка не найдена или уже завершена", show_alert=True)
+        return
+
+    items = data.get("bulk_items", [])
+    upload_errors = data.get("bulk_errors", [])
+    if not items:
+        await callback.answer("Сначала отправьте хотя бы одну .session", show_alert=True)
+        return
+
+    await callback.answer("Анализ и конвертация...")
+    await callback.message.answer(f"Начал обработку: {len(items)} .session")
+
+    converted = []
+    convert_errors = []
+    for index, session_name in enumerate(items, start=1):
+        try:
+            result = await convert_session_account_to_tdata(session_name)
+            converted.append(result)
+            phone = result.get("phone") or "номер не найден"
+            await callback.message.answer(f"{index}/{len(items)} готово: {phone}")
+        except Exception as e:
+            convert_errors.append({"session_name": session_name, "error": str(e)})
+            await callback.message.answer(f"{index}/{len(items)} ошибка: {session_name}\n{e}")
+
+    batches = load_batches()
+    batches[batch_id] = {
+        "kind": "session_to_tdata",
+        "created_at": data.get("created_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source_count": len(items),
+        "upload_errors": upload_errors,
+        "converted": converted,
+        "convert_errors": convert_errors,
+    }
+    save_batches(batches)
+    await state.clear()
+
+    builder = InlineKeyboardBuilder()
+    if converted:
+        builder.row(types.InlineKeyboardButton(text="Получить tdata.zip", callback_data=f"get_bulk_tdata:{batch_id}"))
+    builder.row(types.InlineKeyboardButton(text="В меню", callback_data="back_to_main"))
+
+    await callback.message.answer(
+        "Массовая конвертация .session завершена\n\n"
+        f"Всего: {len(items)}\n"
+        f"Успешно: {len(converted)}\n"
+        f"Ошибок загрузки: {len(upload_errors)}\n"
+        f"Ошибок конвертации: {len(convert_errors)}",
+        reply_markup=builder.as_markup()
+    )
+
+@router.callback_query(F.data.startswith("get_bulk_tdata:"))
+async def action_get_bulk_tdata(callback: types.CallbackQuery):
+    batch_id = callback.data.split(":", 1)[1]
+    batch = load_batches().get(batch_id)
+    if not batch:
+        await callback.answer("Пачка не найдена", show_alert=True)
+        return
+
+    converted = batch.get("converted", [])
+    if not converted:
+        await callback.answer("Нет успешно сконвертированных tdata", show_alert=True)
+        return
+
+    await callback.answer("Отправляю архивы...")
+    await callback.message.answer(f"Отправляю tdata.zip: {len(converted)}")
+
+    sent = 0
+    for index, result in enumerate(converted, start=1):
+        zip_path = result.get("zip_path")
+        if not zip_path or not os.path.exists(zip_path):
+            continue
+        await callback.message.answer_document(
+            types.FSInputFile(zip_path, filename=result.get("zip_name")),
+            caption=f"{index}. {result.get('phone') or 'номер не найден'}"
+        )
+        sent += 1
+
+    await callback.message.answer(f"Готово. Отправлено архивов: {sent}")
 
 @router.callback_query(F.data.startswith("setup_2fa:"))
 async def action_setup_2fa(callback: types.CallbackQuery, state: FSMContext):
