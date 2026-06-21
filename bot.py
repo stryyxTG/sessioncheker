@@ -24,7 +24,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # Библиотеки для работы с Telegram сессиями
 from telethon import TelegramClient, functions
-from telethon.sessions import StringSession
 from pyrogram import Client as PyroClient
 
 # Настройка логирования
@@ -373,8 +372,8 @@ def zip_tdata_dir(tdata_dir: str, zip_path: str):
                 relative_path = os.path.relpath(full_path, tdata_dir)
                 archive.write(full_path, os.path.join("tdata", relative_path))
 
-def build_bulk_result_zip(batch_id: str, file_type: str, converted: list[dict]):
-    zip_name = f"{sanitize_filename(batch_id)}_{file_type}.zip"
+def build_bulk_sessions_zip(batch_id: str, converted: list[dict]):
+    zip_name = f"{sanitize_filename(batch_id)}_sessions.zip"
     zip_path = os.path.join(SESSION_DIR, zip_name)
     if os.path.exists(zip_path):
         os.remove(zip_path)
@@ -382,23 +381,19 @@ def build_bulk_result_zip(batch_id: str, file_type: str, converted: list[dict]):
     used_names = set()
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for result in converted:
-            candidates = []
-            if file_type in ("session", "both"):
-                candidates.append(("sessions", result.get("session_path"), result.get("session_name")))
-            if file_type in ("json", "both"):
-                candidates.append(("json", result.get("json_path"), result.get("json_name")))
+            source_path = result.get("session_path")
+            file_name = result.get("session_name")
+            if not source_path or not os.path.exists(source_path):
+                continue
 
-            for folder, source_path, file_name in candidates:
-                if not source_path or not os.path.exists(source_path):
-                    continue
-                archive_name = os.path.join(folder, file_name or os.path.basename(source_path))
-                base_name, extension = os.path.splitext(archive_name)
-                suffix = 2
-                while archive_name.lower() in used_names:
-                    archive_name = f"{base_name}_{suffix}{extension}"
-                    suffix += 1
-                used_names.add(archive_name.lower())
-                archive.write(source_path, archive_name)
+            archive_name = os.path.join("sessions", file_name or os.path.basename(source_path))
+            base_name, extension = os.path.splitext(archive_name)
+            suffix = 2
+            while archive_name.lower() in used_names:
+                archive_name = f"{base_name}_{suffix}{extension}"
+                suffix += 1
+            used_names.add(archive_name.lower())
+            archive.write(source_path, archive_name)
 
     return zip_name, zip_path
 
@@ -689,51 +684,23 @@ async def get_account_info(session_path: str, lib_type: str = "telethon") -> dic
 
     raise RuntimeError(f"неизвестный тип сессии: {lib_type}")
 
-async def export_session_json(session_path: str, json_path: str, account_info: dict | None = None):
-    client = TelegramClient(session_path, API_ID, API_HASH)
-    account_info = account_info or {}
-    payload = {
-        "type": "telethon",
-        "api_id": API_ID,
-        "api_hash": API_HASH,
-        "session_file": os.path.basename(session_path),
-        "session_string": StringSession.save(client.session),
-        "user_id": account_info.get("user_id"),
-        "phone": account_info.get("phone"),
-        "first_name": account_info.get("first_name"),
-        "last_name": account_info.get("last_name"),
-        "username": account_info.get("username"),
-        "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "note": "Экспорт создан без подключения к аккаунту.",
-    }
-
-    with open(json_path, "w", encoding="utf-8") as file:
-        json.dump(payload, file, ensure_ascii=False, indent=2)
-
-    return json_path
-
 async def convert_tdata_account(tdata_name: str):
     tdata_path = os.path.join(SESSION_DIR, tdata_name)
     output_base = derive_tdata_source_base(tdata_name)
     output_name, output_path = make_output_path(output_base, "session")
-    json_name, json_path = make_output_path(output_base, "json")
 
-    if os.path.exists(output_path) or os.path.exists(json_path):
+    if os.path.exists(output_path):
         output_base = f"{output_base}_{account_key(tdata_name)[:6]}"
         output_name, output_path = make_output_path(output_base, "session")
-        json_name, json_path = make_output_path(output_base, "json")
 
     await convert_tdata_to_session(tdata_path, output_path, verify=False)
     info = load_history().get(tdata_name, {})
     update_history(output_name, info if info else None)
-    await export_session_json(output_path, json_path, info)
 
     return {
         "tdata_name": tdata_name,
         "session_name": output_name,
         "session_path": output_path,
-        "json_name": json_name,
-        "json_path": json_path,
         "phone": info.get("phone") if info else None,
         "user_id": info.get("user_id") if info else None,
     }
@@ -1226,11 +1193,9 @@ async def handle_bulk_session_file(message: types.Message, state: FSMContext):
 
 @router.message(SessionStates.waiting_for_json)
 async def handle_json_string(message: types.Message, state: FSMContext):
-    # В реальных условиях тут можно парсить JSON или сохранять строку в .session файл через StringSession
     string_data = message.text
     file_name = f"json_{message.from_user.id}_{hash(string_data)}.session"
     
-    # Пример сохранения для Telethon StringSession (упрощенно)
     with open(os.path.join(SESSION_DIR, file_name), "w") as f:
         f.write(string_data)
         
@@ -1371,10 +1336,6 @@ async def action_convert_tdata(callback: types.CallbackQuery):
         types.FSInputFile(result["session_path"], filename=result["session_name"]),
         caption="Готовая Telethon .session"
     )
-    await callback.message.answer_document(
-        types.FSInputFile(result["json_path"], filename=result["json_name"]),
-        caption="JSON с данными аккаунта и session_string"
-    )
     await show_session_menu(callback.message, result["session_name"])
 
 @router.callback_query(F.data.startswith("convert_session_tdata:"))
@@ -1454,9 +1415,7 @@ async def action_finish_bulk(callback: types.CallbackQuery, state: FSMContext):
 
     builder = InlineKeyboardBuilder()
     if converted:
-        builder.row(types.InlineKeyboardButton(text="Получить .session", callback_data=f"get_bulk:session:{batch_id}"))
-        builder.row(types.InlineKeyboardButton(text="Получить JSON", callback_data=f"get_bulk:json:{batch_id}"))
-        builder.row(types.InlineKeyboardButton(text="Получить оба", callback_data=f"get_bulk:both:{batch_id}"))
+        builder.row(types.InlineKeyboardButton(text="Получить архив .session", callback_data=f"get_bulk_sessions_zip:{batch_id}"))
     builder.row(types.InlineKeyboardButton(text="В меню", callback_data="back_to_main"))
 
     await callback.message.answer(
@@ -1468,9 +1427,9 @@ async def action_finish_bulk(callback: types.CallbackQuery, state: FSMContext):
         reply_markup=builder.as_markup()
     )
 
-@router.callback_query(F.data.startswith("get_bulk:"))
+@router.callback_query(F.data.startswith("get_bulk_sessions_zip:"))
 async def action_get_bulk_sessions(callback: types.CallbackQuery):
-    _, file_type, batch_id = callback.data.split(":", 2)
+    batch_id = callback.data.split(":", 1)[1]
     batch = load_batches().get(batch_id)
     if not batch:
         await callback.answer("Пачка не найдена", show_alert=True)
@@ -1481,44 +1440,13 @@ async def action_get_bulk_sessions(callback: types.CallbackQuery):
         await callback.answer("В этой пачке нет успешных сессий", show_alert=True)
         return
 
-    captions = {
-        "session": f"Отправляю файлов: {len(converted)} .session",
-        "json": f"Отправляю файлов: {len(converted)} .json",
-        "both": f"Отправляю файлов: {len(converted)} .session и {len(converted)} .json",
-    }
-    if file_type not in captions:
-        await callback.answer("Неизвестный формат", show_alert=True)
-        return
-
-    await callback.answer("Отправляю файлы...")
-    await callback.message.answer(captions[file_type])
-
-    if len(converted) > 20:
-        zip_name, zip_path = build_bulk_result_zip(batch_id, file_type, converted)
-        await callback.message.answer_document(
-            types.FSInputFile(zip_path, filename=zip_name),
-            caption=f"Массовый результат: {len(converted)} аккаунтов"
-        )
-        await callback.message.answer("Готовый архив отправлен.")
-        return
-
-    for index, result in enumerate(converted, start=1):
-        session_path = result.get("session_path")
-        json_path = result.get("json_path")
-        phone = result.get("phone") or "без проверки номера"
-
-        if file_type in ("session", "both") and session_path and os.path.exists(session_path):
-            await callback.message.answer_document(
-                types.FSInputFile(session_path, filename=result.get("session_name")),
-                caption=f"{index}. {phone} | .session"
-            )
-        if file_type in ("json", "both") and json_path and os.path.exists(json_path):
-            await callback.message.answer_document(
-                types.FSInputFile(json_path, filename=result.get("json_name")),
-                caption=f"{index}. {phone} | JSON"
-            )
-
-    await callback.message.answer("Готовые файлы отправлены.")
+    await callback.answer("Собираю архив...")
+    zip_name, zip_path = build_bulk_sessions_zip(batch_id, converted)
+    await callback.message.answer_document(
+        types.FSInputFile(zip_path, filename=zip_name),
+        caption=f"Архив с .session: {len(converted)} аккаунтов"
+    )
+    await callback.message.answer("Архив с сессиями отправлен.")
 
 @router.callback_query(F.data.startswith("finish_bulk_sessions:"))
 async def action_finish_bulk_sessions(callback: types.CallbackQuery, state: FSMContext):
