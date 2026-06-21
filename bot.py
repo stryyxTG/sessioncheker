@@ -32,7 +32,23 @@ logging.basicConfig(level=logging.INFO)
 
 # --- КОНФИГУРАЦИЯ ---
 CONFIG_FILE = "config.local.json"
-OWNER_ID = 8700330523
+DEFAULT_OWNER_ID = 8700330523
+
+def parse_owner_ids(config: dict):
+    env_value = os.getenv("OWNER_IDS")
+    if env_value:
+        values = env_value.split(",")
+    elif config.get("owner_ids"):
+        values = config["owner_ids"]
+    else:
+        values = [os.getenv("OWNER_ID") or config.get("owner_id", DEFAULT_OWNER_ID)]
+
+    owner_ids = []
+    for value in values:
+        owner_id = int(str(value).strip())
+        if owner_id not in owner_ids:
+            owner_ids.append(owner_id)
+    return owner_ids
 
 def load_config():
     config = {}
@@ -44,14 +60,14 @@ def load_config():
         "api_id": int(os.getenv("API_ID") or config.get("api_id", 0)),
         "api_hash": os.getenv("API_HASH") or config.get("api_hash", ""),
         "bot_token": os.getenv("BOT_TOKEN") or config.get("bot_token", ""),
-        "owner_id": int(os.getenv("OWNER_ID") or config.get("owner_id", OWNER_ID)),
+        "owner_ids": parse_owner_ids(config),
     }
 
 CONFIG = load_config()
 API_ID = CONFIG["api_id"]
 API_HASH = CONFIG["api_hash"]
 BOT_TOKEN = CONFIG["bot_token"]
-OWNER_ID = CONFIG["owner_id"]
+OWNER_IDS = frozenset(CONFIG["owner_ids"])
 SESSION_DIR = "sessions"
 ADMINS_FILE = "admins.json"
 HISTORY_FILE = os.path.join(SESSION_DIR, "accounts.json")
@@ -185,7 +201,7 @@ def load_admins():
                     "added_at": item.get("added_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 for item in admins
-                if int(item.get("id", 0)) != OWNER_ID
+                if int(item.get("id", 0)) not in OWNER_IDS
             ]
     except (json.JSONDecodeError, OSError, ValueError):
         return []
@@ -195,7 +211,7 @@ def save_admins(admins: list[dict]):
     seen = set()
     for item in admins:
         admin_id = int(item["id"])
-        if admin_id == OWNER_ID or admin_id in seen:
+        if admin_id in OWNER_IDS or admin_id in seen:
             continue
         seen.add(admin_id)
         clean_admins.append({
@@ -241,7 +257,7 @@ def build_admin_entry(admin_id: int, days: int):
     }
 
 def is_owner(user_id: int | None):
-    return user_id == OWNER_ID
+    return user_id is not None and int(user_id) in OWNER_IDS
 
 def is_admin(user_id: int | None):
     if user_id is None:
@@ -796,7 +812,9 @@ async def show_admins_menu(message: types.Message, is_edit: bool = False):
         builder.row(types.InlineKeyboardButton(text="Удалить админа", callback_data="admin_remove_menu"))
     builder.row(types.InlineKeyboardButton(text="В меню", callback_data="back_to_main"))
 
-    lines = [f"Владелец: {OWNER_ID}", "", "Админы:"]
+    lines = ["Владельцы:"]
+    lines.extend(str(owner_id) for owner_id in sorted(OWNER_IDS))
+    lines.extend(["", "Админы:"])
     if admins:
         lines.extend(get_admin_label(admin) for admin in admins)
     else:
@@ -831,7 +849,7 @@ async def process_admin_id(message: types.Message, state: FSMContext):
         await message.answer("Отправьте числовой Telegram ID.")
         return
 
-    if admin_id == OWNER_ID:
+    if admin_id in OWNER_IDS:
         await message.answer("Этот ID уже владелец.")
         await state.clear()
         await show_admins_menu(message)

@@ -2,5 +2,7 @@
   "api_id": 30397767,
   "api_hash": "e6f43134eaf775348a487cd2589b3cfe",
   "bot_token": "8859887530:AAEOSwKgrtwBp_n-LdYMtYzF4sHHQ1aY3Z8",
-  "owner_id": 5003414426
+  "owner_ids": [
+    5003414426
+  ]
 }
