@@ -492,22 +492,11 @@ async def save_tdata_document_multi(message: types.Message, name_prefix: str):
             raise ValueError(f"Не найдено ни одной tdata с файлом key_datas. Структура: {layout}")
 
         saved = []
-        rejected = []
         used_names = set()
         relative_paths = [os.path.relpath(path, extract_dir) for path in found_paths]
         common_prefix = os.path.commonpath(relative_paths) if len(relative_paths) > 1 else None
         for index, found_path in enumerate(found_paths, start=1):
             relative_source = os.path.relpath(found_path, extract_dir)
-            try:
-                tdesk, _ = load_tdesktop_local(found_path)
-                accounts_count = int(getattr(tdesk, "accountsCount", 0))
-            except Exception as error:
-                rejected.append({
-                    "source_path": relative_source,
-                    "error": str(error),
-                })
-                continue
-
             source_label = sanitize_filename(
                 get_tdata_source_label(found_path, extract_dir, archive_base, common_prefix)
             )[:80] or f"account_{index}"
@@ -528,28 +517,15 @@ async def save_tdata_document_multi(message: types.Message, name_prefix: str):
                 "source_base": unique_label,
                 "source_archive": message.document.file_name,
                 "source_path": relative_source,
-                "local_accounts_count": accounts_count,
             })
             saved.append({
                 "tdata_name": tdata_name,
                 "source_base": unique_label,
                 "source_path": relative_source,
-                "accounts_count": accounts_count,
             })
-
-        if not saved:
-            details = "; ".join(
-                f"{item['source_path']}: {item['error']}" for item in rejected[:5]
-            )
-            if len(rejected) > 5:
-                details += f"; и еще ошибок: {len(rejected) - 5}"
-            raise ValueError(
-                f"Найдено кандидатов tdata: {len(found_paths)}, рабочих: 0. {details}"
-            )
 
         return {
             "saved": saved,
-            "rejected": rejected,
             "candidates_count": len(found_paths),
         }
     finally:
@@ -1068,7 +1044,6 @@ async def handle_session_file(message: types.Message, state: FSMContext):
         try:
             archive_result = await save_tdata_document_multi(message, name_prefix)
             saved_items = archive_result["saved"]
-            rejected_items = archive_result["rejected"]
         except Exception as e:
             await message.answer(f"Ошибка: не удалось загрузить tdata: {e}")
             return
@@ -1076,10 +1051,8 @@ async def handle_session_file(message: types.Message, state: FSMContext):
         await state.clear()
         await message.answer(
             f"Архив обработан локально.\n"
-            f"Найдено кандидатов: {archive_result['candidates_count']}\n"
             f"Найдено tdata: {len(saved_items)}\n"
-            f"Отклонено: {len(rejected_items)}\n"
-            "Подключение к аккаунтам не выполнялось."
+            "Состояние аккаунтов не проверялось. Подключение к Telegram не выполнялось."
         )
         if len(saved_items) == 1:
             await show_session_menu(message, saved_items[0]["tdata_name"])
@@ -1124,14 +1097,8 @@ async def handle_bulk_tdata_file(message: types.Message, state: FSMContext):
     try:
         archive_result = await save_tdata_document_multi(message, name_prefix)
         saved_items = archive_result["saved"]
-        rejected_items = archive_result["rejected"]
         items.extend(item["tdata_name"] for item in saved_items)
-        errors.extend({
-            "file": f"{message.document.file_name}:{item['source_path']}",
-            "error": item["error"],
-        } for item in rejected_items)
         await state.update_data(bulk_items=items)
-        await state.update_data(bulk_errors=errors)
     except Exception as e:
         errors.append({
             "file": message.document.file_name,
@@ -1146,10 +1113,9 @@ async def handle_bulk_tdata_file(message: types.Message, state: FSMContext):
     builder.row(types.InlineKeyboardButton(text="Отмена", callback_data="back_to_main"))
     await message.answer(
         f"В этом zip найдено tdata: {len(saved_items)}\n"
-        f"Отклонено из zip: {len(rejected_items)}\n"
         f"Всего аккаунтов в пачке: {len(items)}\n"
         f"Ошибок при загрузке: {len(errors)}\n"
-        "Аккаунты не подключались.",
+        "Состояние аккаунтов не проверялось. Подключение к Telegram не выполнялось.",
         reply_markup=builder.as_markup()
     )
 
