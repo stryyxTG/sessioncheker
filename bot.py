@@ -31,7 +31,8 @@ from pyrogram import Client as PyroClient
 logging.basicConfig(level=logging.INFO)
 
 # --- КОНФИГУРАЦИЯ ---
-CONFIG_FILE = "config.local.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, "config.local.json")
 DEFAULT_OWNER_ID = 8700330523
 
 def parse_owner_ids(config: dict):
@@ -68,8 +69,8 @@ API_ID = CONFIG["api_id"]
 API_HASH = CONFIG["api_hash"]
 BOT_TOKEN = CONFIG["bot_token"]
 OWNER_IDS = frozenset(CONFIG["owner_ids"])
-SESSION_DIR = "sessions"
-ADMINS_FILE = "admins.json"
+SESSION_DIR = os.path.join(BASE_DIR, "sessions")
+ADMINS_FILE = os.path.join(BASE_DIR, "admins.json")
 HISTORY_FILE = os.path.join(SESSION_DIR, "accounts.json")
 BATCH_FILE = os.path.join(SESSION_DIR, "bulk_batches.json")
 CODE_PATTERN = re.compile(r"\b\d{5,6}\b")
@@ -407,10 +408,24 @@ def safe_extract_zip(zip_path: str, destination: str):
     destination_abs = os.path.abspath(destination)
     with zipfile.ZipFile(zip_path) as archive:
         for member in archive.infolist():
-            member_path = os.path.abspath(os.path.join(destination, member.filename))
-            if not member_path.startswith(destination_abs + os.sep):
+            normalized_name = member.filename.replace("\\", "/").lstrip("/")
+            parts = [part for part in normalized_name.split("/") if part not in ("", ".")]
+            if not parts:
+                continue
+            if any(part == ".." for part in parts):
                 raise ValueError("Архив содержит небезопасные пути.")
-        archive.extractall(destination)
+
+            member_path = os.path.abspath(os.path.join(destination, *parts))
+            if os.path.commonpath([destination_abs, member_path]) != destination_abs:
+                raise ValueError("Архив содержит небезопасные пути.")
+
+            if member.is_dir() or normalized_name.endswith("/"):
+                os.makedirs(member_path, exist_ok=True)
+                continue
+
+            os.makedirs(os.path.dirname(member_path), exist_ok=True)
+            with archive.open(member) as source, open(member_path, "wb") as target:
+                shutil.copyfileobj(source, target, length=1024 * 1024)
 
 def find_tdata_paths(root_path: str):
     found = []
@@ -420,15 +435,35 @@ def find_tdata_paths(root_path: str):
             dirs[:] = []
     return found
 
-def get_tdata_source_label(tdata_path: str, extract_dir: str, archive_base: str):
+def get_tdata_source_label(tdata_path: str, extract_dir: str, archive_base: str, common_prefix: str | None = None):
     relative_path = os.path.relpath(tdata_path, extract_dir)
     if relative_path == ".":
         return archive_base
 
     parts = relative_path.split(os.sep)
+    if common_prefix and common_prefix != ".":
+        common_parts = common_prefix.split(os.sep)
+        if parts[:len(common_parts)] == common_parts:
+            remaining = parts[len(common_parts):]
+            if remaining:
+                return remaining[0]
+
+    if len(parts) >= 3 and parts[-1].lower() == "tdata":
+        return parts[0]
     if parts[-1].lower() == "tdata" and len(parts) > 1:
         return parts[-2]
     return parts[-1]
+
+def describe_tdata_layout(root_path: str):
+    entries = []
+    for current_root, dirs, files in os.walk(root_path):
+        relative = os.path.relpath(current_root, root_path)
+        if relative != ".":
+            entries.append(relative)
+        entries.extend(os.path.join(relative, file_name) for file_name in files[:3])
+        if len(entries) >= 15:
+            break
+    return ", ".join(entries[:15]) or "архив пуст"
 
 async def save_tdata_document_multi(message: types.Message, name_prefix: str):
     archive_base = sanitize_filename(os.path.splitext(message.document.file_name)[0]) or "tdata"
@@ -436,10 +471,15 @@ async def save_tdata_document_multi(message: types.Message, name_prefix: str):
     zip_path = os.path.join(SESSION_DIR, f"{work_name}.zip")
     extract_dir = os.path.join(SESSION_DIR, f"{work_name}_extract")
 
-    file = await bot.get_file(message.document.file_id)
-    await bot.download_file(file.file_path, zip_path)
-
+    os.makedirs(SESSION_DIR, exist_ok=True)
     try:
+        file = await bot.get_file(message.document.file_id)
+        with open(zip_path, "wb") as destination:
+            await bot.download_file(file.file_path, destination)
+
+        if not os.path.exists(zip_path) or os.path.getsize(zip_path) == 0:
+            raise RuntimeError(f"Telegram не скачал архив во временный файл: {zip_path}")
+
         if os.path.exists(extract_dir):
             shutil.rmtree(extract_dir)
 
@@ -447,12 +487,17 @@ async def save_tdata_document_multi(message: types.Message, name_prefix: str):
         safe_extract_zip(zip_path, extract_dir)
         found_paths = find_tdata_paths(extract_dir)
         if not found_paths:
-            raise ValueError("В архиве не найдено ни одной tdata с файлом key_datas.")
+            layout = describe_tdata_layout(extract_dir)
+            raise ValueError(f"Не найдено ни одной tdata с файлом key_datas. Структура: {layout}")
 
         saved = []
         used_names = set()
+        relative_paths = [os.path.relpath(path, extract_dir) for path in found_paths]
+        common_prefix = os.path.commonpath(relative_paths) if len(relative_paths) > 1 else None
         for index, found_path in enumerate(found_paths, start=1):
-            source_label = sanitize_filename(get_tdata_source_label(found_path, extract_dir, archive_base))[:80] or f"account_{index}"
+            source_label = sanitize_filename(
+                get_tdata_source_label(found_path, extract_dir, archive_base, common_prefix)
+            )[:80] or f"account_{index}"
             unique_label = source_label
             suffix = 2
             while unique_label.lower() in used_names:
