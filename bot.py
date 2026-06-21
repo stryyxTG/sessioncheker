@@ -130,6 +130,12 @@ def resolve_account_key(key: str) -> str | None:
             return session_name
     return None
 
+def resolve_account_identifier(identifier: str) -> str | None:
+    decoded = identifier.strip()
+    if decoded in list_saved_accounts():
+        return decoded
+    return resolve_account_key(decoded)
+
 def sync_history_with_files():
     history = load_history()
     existing = set(list_saved_accounts())
@@ -491,10 +497,22 @@ async def save_tdata_document_multi(message: types.Message, name_prefix: str):
             raise ValueError(f"Не найдено ни одной tdata с файлом key_datas. Структура: {layout}")
 
         saved = []
+        rejected = []
         used_names = set()
         relative_paths = [os.path.relpath(path, extract_dir) for path in found_paths]
         common_prefix = os.path.commonpath(relative_paths) if len(relative_paths) > 1 else None
         for index, found_path in enumerate(found_paths, start=1):
+            relative_source = os.path.relpath(found_path, extract_dir)
+            try:
+                tdesk, _ = load_tdesktop_local(found_path)
+                accounts_count = int(getattr(tdesk, "accountsCount", 0))
+            except Exception as error:
+                rejected.append({
+                    "source_path": relative_source,
+                    "error": str(error),
+                })
+                continue
+
             source_label = sanitize_filename(
                 get_tdata_source_label(found_path, extract_dir, archive_base, common_prefix)
             )[:80] or f"account_{index}"
@@ -511,19 +529,34 @@ async def save_tdata_document_multi(message: types.Message, name_prefix: str):
                 shutil.rmtree(target_dir)
             shutil.copytree(found_path, target_dir)
 
-            relative_source = os.path.relpath(found_path, extract_dir)
             update_history(tdata_name, {
                 "source_base": unique_label,
                 "source_archive": message.document.file_name,
                 "source_path": relative_source,
+                "local_accounts_count": accounts_count,
             })
             saved.append({
                 "tdata_name": tdata_name,
                 "source_base": unique_label,
                 "source_path": relative_source,
+                "accounts_count": accounts_count,
             })
 
-        return saved
+        if not saved:
+            details = "; ".join(
+                f"{item['source_path']}: {item['error']}" for item in rejected[:5]
+            )
+            if len(rejected) > 5:
+                details += f"; и еще ошибок: {len(rejected) - 5}"
+            raise ValueError(
+                f"Найдено кандидатов tdata: {len(found_paths)}, рабочих: 0. {details}"
+            )
+
+        return {
+            "saved": saved,
+            "rejected": rejected,
+            "candidates_count": len(found_paths),
+        }
     finally:
         if os.path.exists(zip_path):
             os.remove(zip_path)
@@ -576,15 +609,41 @@ def load_opentele():
         except BaseException as retry_error:
             raise RuntimeError(f"opentele не загрузился после патча совместимости: {retry_error}")
 
-async def convert_tdata_to_session(tdata_path: str, output_session_path: str, verify: bool = False):
+def normalize_opentele_error(error: BaseException):
+    text = str(error).strip() or error.__class__.__name__
+    if "No account has been loaded" in text:
+        return (
+            "в папке найден key_datas, но Telegram-аккаунт не загрузился. "
+            "Обычно tdata неполная, повреждена, защищена паролем или выбрана не корневая папка tdata"
+        )
+    return text
+
+def load_tdesktop_local(tdata_path: str):
     TDesktop, UseCurrentSession = load_opentele()
+    try:
+        tdesk = TDesktop(tdata_path)
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        raise
+    except BaseException as error:
+        raise RuntimeError(normalize_opentele_error(error)) from error
 
-    tdesk = TDesktop(tdata_path)
-    if not tdesk.isLoaded():
-        raise RuntimeError("Не удалось прочитать tdata. Проверьте, что архив содержит рабочую папку tdata.")
+    if not tdesk.isLoaded() or getattr(tdesk, "accountsCount", 0) < 1:
+        raise RuntimeError("tdata прочитана, но внутри не найдено ни одного Telegram-аккаунта")
 
-    client = await tdesk.ToTelethon(session=output_session_path, flag=UseCurrentSession)
-    client.session.save()
+    return tdesk, UseCurrentSession
+
+async def convert_tdata_to_session(tdata_path: str, output_session_path: str, verify: bool = False):
+    tdesk, UseCurrentSession = load_tdesktop_local(tdata_path)
+
+    try:
+        client = await tdesk.ToTelethon(session=output_session_path, flag=UseCurrentSession)
+        client.session.save()
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        raise
+    except BaseException as error:
+        if os.path.exists(output_session_path):
+            os.remove(output_session_path)
+        raise RuntimeError(f"не удалось создать .session: {normalize_opentele_error(error)}") from error
 
     if not verify:
         return output_session_path
@@ -1040,7 +1099,9 @@ async def handle_session_file(message: types.Message, state: FSMContext):
         name_prefix = f"tdata_{message.from_user.id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
         try:
-            saved_items = await save_tdata_document_multi(message, name_prefix)
+            archive_result = await save_tdata_document_multi(message, name_prefix)
+            saved_items = archive_result["saved"]
+            rejected_items = archive_result["rejected"]
         except Exception as e:
             await message.answer(f"Ошибка: не удалось загрузить tdata: {e}")
             return
@@ -1048,7 +1109,9 @@ async def handle_session_file(message: types.Message, state: FSMContext):
         await state.clear()
         await message.answer(
             f"Архив обработан локально.\n"
+            f"Найдено кандидатов: {archive_result['candidates_count']}\n"
             f"Найдено tdata: {len(saved_items)}\n"
+            f"Отклонено: {len(rejected_items)}\n"
             "Подключение к аккаунтам не выполнялось."
         )
         if len(saved_items) == 1:
@@ -1092,9 +1155,16 @@ async def handle_bulk_tdata_file(message: types.Message, state: FSMContext):
     name_prefix = f"tdata_{message.from_user.id}_{batch_id}_{len(items) + 1}"
 
     try:
-        saved_items = await save_tdata_document_multi(message, name_prefix)
+        archive_result = await save_tdata_document_multi(message, name_prefix)
+        saved_items = archive_result["saved"]
+        rejected_items = archive_result["rejected"]
         items.extend(item["tdata_name"] for item in saved_items)
+        errors.extend({
+            "file": f"{message.document.file_name}:{item['source_path']}",
+            "error": item["error"],
+        } for item in rejected_items)
         await state.update_data(bulk_items=items)
+        await state.update_data(bulk_errors=errors)
     except Exception as e:
         errors.append({
             "file": message.document.file_name,
@@ -1109,6 +1179,7 @@ async def handle_bulk_tdata_file(message: types.Message, state: FSMContext):
     builder.row(types.InlineKeyboardButton(text="Отмена", callback_data="back_to_main"))
     await message.answer(
         f"В этом zip найдено tdata: {len(saved_items)}\n"
+        f"Отклонено из zip: {len(rejected_items)}\n"
         f"Всего аккаунтов в пачке: {len(items)}\n"
         f"Ошибок при загрузке: {len(errors)}\n"
         "Аккаунты не подключались.",
@@ -1265,7 +1336,7 @@ async def action_get_code(callback: types.CallbackQuery):
 
 @router.callback_query(F.data.startswith("refresh_account:"))
 async def action_refresh_account(callback: types.CallbackQuery):
-    session_name = resolve_account_key(callback.data.split(":")[1])
+    session_name = resolve_account_identifier(callback.data.split(":", 1)[1])
     if not session_name:
         await callback.answer("Сессия не найдена", show_alert=True)
         return
@@ -1281,7 +1352,7 @@ async def action_refresh_account(callback: types.CallbackQuery):
 
 @router.callback_query(F.data.startswith("convert_tdata:"))
 async def action_convert_tdata(callback: types.CallbackQuery):
-    tdata_name = resolve_account_key(callback.data.split(":")[1])
+    tdata_name = resolve_account_identifier(callback.data.split(":", 1)[1])
     if not tdata_name:
         await callback.answer("tdata не найдена", show_alert=True)
         return
