@@ -350,6 +350,35 @@ def zip_tdata_dir(tdata_dir: str, zip_path: str):
                 relative_path = os.path.relpath(full_path, tdata_dir)
                 archive.write(full_path, os.path.join("tdata", relative_path))
 
+def build_bulk_result_zip(batch_id: str, file_type: str, converted: list[dict]):
+    zip_name = f"{sanitize_filename(batch_id)}_{file_type}.zip"
+    zip_path = os.path.join(SESSION_DIR, zip_name)
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+
+    used_names = set()
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for result in converted:
+            candidates = []
+            if file_type in ("session", "both"):
+                candidates.append(("sessions", result.get("session_path"), result.get("session_name")))
+            if file_type in ("json", "both"):
+                candidates.append(("json", result.get("json_path"), result.get("json_name")))
+
+            for folder, source_path, file_name in candidates:
+                if not source_path or not os.path.exists(source_path):
+                    continue
+                archive_name = os.path.join(folder, file_name or os.path.basename(source_path))
+                base_name, extension = os.path.splitext(archive_name)
+                suffix = 2
+                while archive_name.lower() in used_names:
+                    archive_name = f"{base_name}_{suffix}{extension}"
+                    suffix += 1
+                used_names.add(archive_name.lower())
+                archive.write(source_path, archive_name)
+
+    return zip_name, zip_path
+
 def delete_local_account(session_name: str):
     path = os.path.join(SESSION_DIR, session_name)
     if os.path.isdir(path):
@@ -367,38 +396,73 @@ def safe_extract_zip(zip_path: str, destination: str):
                 raise ValueError("Архив содержит небезопасные пути.")
         archive.extractall(destination)
 
-def find_tdata_path(root_path: str):
-    if os.path.exists(os.path.join(root_path, "key_datas")):
-        return root_path
+def find_tdata_paths(root_path: str):
+    found = []
+    for current_root, dirs, files in os.walk(root_path):
+        if any(file_name.lower() == "key_datas" for file_name in files):
+            found.append(current_root)
+            dirs[:] = []
+    return found
 
-    for current_root, _, files in os.walk(root_path):
-        if "key_datas" in files:
-            return current_root
+def get_tdata_source_label(tdata_path: str, extract_dir: str, archive_base: str):
+    relative_path = os.path.relpath(tdata_path, extract_dir)
+    if relative_path == ".":
+        return archive_base
 
-    return None
+    parts = relative_path.split(os.sep)
+    if parts[-1].lower() == "tdata" and len(parts) > 1:
+        return parts[-2]
+    return parts[-1]
 
-async def save_tdata_document(message: types.Message, tdata_name: str):
-    target_dir = os.path.join(SESSION_DIR, tdata_name)
-    zip_path = os.path.join(SESSION_DIR, f"{tdata_name}.zip")
-    extract_dir = os.path.join(SESSION_DIR, f"{tdata_name}_extract")
+async def save_tdata_document_multi(message: types.Message, name_prefix: str):
+    archive_base = sanitize_filename(os.path.splitext(message.document.file_name)[0]) or "tdata"
+    work_name = f"{name_prefix}_{hashlib.sha1(message.document.file_unique_id.encode()).hexdigest()[:10]}"
+    zip_path = os.path.join(SESSION_DIR, f"{work_name}.zip")
+    extract_dir = os.path.join(SESSION_DIR, f"{work_name}_extract")
 
     file = await bot.get_file(message.document.file_id)
     await bot.download_file(file.file_path, zip_path)
 
     try:
-        if os.path.exists(target_dir):
-            shutil.rmtree(target_dir)
         if os.path.exists(extract_dir):
             shutil.rmtree(extract_dir)
 
         os.makedirs(extract_dir, exist_ok=True)
         safe_extract_zip(zip_path, extract_dir)
-        found_tdata = find_tdata_path(extract_dir)
-        if not found_tdata:
-            raise ValueError("В архиве не найден файл key_datas.")
+        found_paths = find_tdata_paths(extract_dir)
+        if not found_paths:
+            raise ValueError("В архиве не найдено ни одной tdata с файлом key_datas.")
 
-        shutil.copytree(found_tdata, target_dir)
-        return target_dir
+        saved = []
+        used_names = set()
+        for index, found_path in enumerate(found_paths, start=1):
+            source_label = sanitize_filename(get_tdata_source_label(found_path, extract_dir, archive_base))[:80] or f"account_{index}"
+            unique_label = source_label
+            suffix = 2
+            while unique_label.lower() in used_names:
+                unique_label = f"{source_label}_{suffix}"
+                suffix += 1
+            used_names.add(unique_label.lower())
+
+            tdata_name = f"{name_prefix}_{index}_{unique_label}"
+            target_dir = os.path.join(SESSION_DIR, tdata_name)
+            if os.path.exists(target_dir):
+                shutil.rmtree(target_dir)
+            shutil.copytree(found_path, target_dir)
+
+            relative_source = os.path.relpath(found_path, extract_dir)
+            update_history(tdata_name, {
+                "source_base": unique_label,
+                "source_archive": message.document.file_name,
+                "source_path": relative_source,
+            })
+            saved.append({
+                "tdata_name": tdata_name,
+                "source_base": unique_label,
+                "source_path": relative_source,
+            })
+
+        return saved
     finally:
         if os.path.exists(zip_path):
             os.remove(zip_path)
@@ -533,6 +597,11 @@ async def convert_tdata_account(tdata_name: str):
     output_base = derive_tdata_source_base(tdata_name)
     output_name, output_path = make_output_path(output_base, "session")
     json_name, json_path = make_output_path(output_base, "json")
+
+    if os.path.exists(output_path) or os.path.exists(json_path):
+        output_base = f"{output_base}_{account_key(tdata_name)[:6]}"
+        output_name, output_path = make_output_path(output_base, "session")
+        json_name, json_path = make_output_path(output_base, "json")
 
     await convert_tdata_to_session(tdata_path, output_path, verify=False)
     info = load_history().get(tdata_name, {})
@@ -865,7 +934,9 @@ async def process_add_type(callback: types.CallbackQuery, state: FSMContext):
         builder.row(types.InlineKeyboardButton(text="Анализ и конвертация", callback_data=f"finish_bulk:{batch_id}"))
         builder.row(types.InlineKeyboardButton(text="Отмена", callback_data="back_to_main"))
         await callback.message.answer(
-            "Кидайте zip-архивы tdata по одному или пачкой файлов. Когда закончите, нажмите анализ и конвертацию.",
+            "Кидайте zip-архивы по одному или пачкой файлов. Один zip может содержать много аккаунтов: "
+            "папки по ID, номеру или имени, а внутри каждой папка tdata либо сразу key_datas. "
+            "Когда закончите, нажмите анализ и конвертацию.",
             reply_markup=builder.as_markup()
         )
         await state.set_state(SessionStates.waiting_for_bulk_tdata)
@@ -903,20 +974,26 @@ async def handle_session_file(message: types.Message, state: FSMContext):
             await message.answer("Ошибка: для tdata отправьте архив .zip.")
             return
 
-        safe_name = sanitize_filename(message.document.file_name.rsplit(".", 1)[0])
-        tdata_name = f"tdata_{message.from_user.id}_{safe_name}"
+        name_prefix = f"tdata_{message.from_user.id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
         try:
-            await save_tdata_document(message, tdata_name)
+            saved_items = await save_tdata_document_multi(message, name_prefix)
         except Exception as e:
             await message.answer(f"Ошибка: не удалось загрузить tdata: {e}")
             return
 
         await state.clear()
-        update_history(tdata_name, {"source_base": safe_name})
-        await message.answer(f"Готово: tdata {tdata_name} успешно загружена.")
-        await message.answer("Номер не проверялся: tdata добавлена без подключения к аккаунту.")
-        await show_session_menu(message, tdata_name)
+        await message.answer(
+            f"Архив обработан локально.\n"
+            f"Найдено tdata: {len(saved_items)}\n"
+            "Подключение к аккаунтам не выполнялось."
+        )
+        if len(saved_items) == 1:
+            await show_session_menu(message, saved_items[0]["tdata_name"])
+        else:
+            builder = InlineKeyboardBuilder()
+            builder.row(types.InlineKeyboardButton(text="Открыть список", callback_data="list_sessions"))
+            await message.answer("Все найденные tdata добавлены отдельно.", reply_markup=builder.as_markup())
         return
     
     file_name = f"{lib_type}_{message.document.file_name}"
@@ -949,13 +1026,11 @@ async def handle_bulk_tdata_file(message: types.Message, state: FSMContext):
         await message.answer("Пропустил файл: для tdata нужен .zip")
         return
 
-    safe_name = sanitize_filename(message.document.file_name.rsplit(".", 1)[0])
-    tdata_name = f"tdata_{message.from_user.id}_{batch_id}_{len(items) + 1}_{safe_name}"
+    name_prefix = f"tdata_{message.from_user.id}_{batch_id}_{len(items) + 1}"
 
     try:
-        await save_tdata_document(message, tdata_name)
-        update_history(tdata_name, {"source_base": safe_name})
-        items.append(tdata_name)
+        saved_items = await save_tdata_document_multi(message, name_prefix)
+        items.extend(item["tdata_name"] for item in saved_items)
         await state.update_data(bulk_items=items)
     except Exception as e:
         errors.append({
@@ -970,7 +1045,10 @@ async def handle_bulk_tdata_file(message: types.Message, state: FSMContext):
     builder.row(types.InlineKeyboardButton(text="Анализ и конвертация", callback_data=f"finish_bulk:{batch_id}"))
     builder.row(types.InlineKeyboardButton(text="Отмена", callback_data="back_to_main"))
     await message.answer(
-        f"Добавлено в пачку: {len(items)}\nОшибок при загрузке: {len(errors)}",
+        f"В этом zip найдено tdata: {len(saved_items)}\n"
+        f"Всего аккаунтов в пачке: {len(items)}\n"
+        f"Ошибок при загрузке: {len(errors)}\n"
+        "Аккаунты не подключались.",
         reply_markup=builder.as_markup()
     )
 
@@ -1203,7 +1281,10 @@ async def action_finish_bulk(callback: types.CallbackQuery, state: FSMContext):
         return
 
     await callback.answer("Анализ и конвертация...")
-    await callback.message.answer(f"Начал обработку пачки: {len(items)} tdata")
+    progress_message = await callback.message.answer(
+        f"Начал последовательный анализ: {len(items)} tdata\n"
+        "Подключение к аккаунтам не выполняется."
+    )
 
     converted = []
     convert_errors = []
@@ -1211,14 +1292,19 @@ async def action_finish_bulk(callback: types.CallbackQuery, state: FSMContext):
         try:
             result = await convert_tdata_account(tdata_name)
             converted.append(result)
-            phone = result.get("phone") or "без проверки номера"
-            await callback.message.answer(f"{index}/{len(items)} готово: {phone}")
         except Exception as e:
             convert_errors.append({
                 "tdata_name": tdata_name,
                 "error": str(e),
             })
-            await callback.message.answer(f"{index}/{len(items)} ошибка: {tdata_name}\n{e}")
+
+        if index % 25 == 0 or index == len(items):
+            await progress_message.edit_text(
+                f"Обработано: {index}/{len(items)}\n"
+                f"Успешно: {len(converted)}\n"
+                f"Ошибок: {len(convert_errors)}\n"
+                "Аккаунты не подключались."
+            )
 
     batches = load_batches()
     batches[batch_id] = {
@@ -1272,6 +1358,15 @@ async def action_get_bulk_sessions(callback: types.CallbackQuery):
 
     await callback.answer("Отправляю файлы...")
     await callback.message.answer(captions[file_type])
+
+    if len(converted) > 20:
+        zip_name, zip_path = build_bulk_result_zip(batch_id, file_type, converted)
+        await callback.message.answer_document(
+            types.FSInputFile(zip_path, filename=zip_name),
+            caption=f"Массовый результат: {len(converted)} аккаунтов"
+        )
+        await callback.message.answer("Готовый архив отправлен.")
+        return
 
     for index, result in enumerate(converted, start=1):
         session_path = result.get("session_path")
