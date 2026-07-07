@@ -24,6 +24,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # Библиотеки для работы с Telegram сессиями
 from telethon import TelegramClient, functions
+from telethon.crypto import AuthKey as TelethonAuthKey
+from telethon.sessions import SQLiteSession
 from pyrogram import Client as PyroClient
 
 # Настройка логирования
@@ -75,6 +77,13 @@ BATCH_FILE = os.path.join(SESSION_DIR, "bulk_batches.json")
 CODE_PATTERN = re.compile(r"\b\d{5,6}\b")
 TELEGRAM_TEXT_LIMIT = 3900
 SESSIONS_PER_PAGE = 7
+TELEGRAM_DC_OPTIONS = {
+    1: ("149.154.175.50", 443),
+    2: ("149.154.167.51", 443),
+    3: ("149.154.175.100", 443),
+    4: ("149.154.167.91", 443),
+    5: ("149.154.171.5", 443),
+}
 
 if not os.path.exists(SESSION_DIR):
     os.makedirs(SESSION_DIR)
@@ -603,8 +612,140 @@ def load_tdesktop_local(tdata_path: str):
 
     return tdesk, UseCurrentSession
 
+def load_tdata_accounts_direct(tdata_path: str):
+    try:
+        from PyQt5.QtCore import QByteArray, QDataStream
+        from opentele.td import AuthKey, Storage
+    except ImportError as e:
+        raise RuntimeError(f"не удалось загрузить зависимости для прямого чтения tdata: {e}") from e
+
+    try:
+        key_data = Storage.ReadFile("key_data", tdata_path)
+        salt = QByteArray()
+        key_encrypted = QByteArray()
+        info_encrypted = QByteArray()
+        key_data.stream >> salt >> key_encrypted >> info_encrypted
+
+        passcode_key = Storage.CreateLocalKey(salt, QByteArray())
+        key_inner_data = Storage.DecryptLocal(key_encrypted, passcode_key)
+        local_key = AuthKey(key_inner_data.stream.readRawData(256))
+
+        info = Storage.DecryptLocal(info_encrypted, local_key)
+        count = info.stream.readInt32()
+        if count <= 0:
+            raise RuntimeError("в key_datas нет аккаунтов")
+
+        indexes = []
+        for _ in range(count):
+            account_index = info.stream.readInt32()
+            if 0 <= account_index < 3:
+                indexes.append(account_index)
+
+        active_index = None
+        if not info.stream.atEnd():
+            active_index = info.stream.readInt32()
+        if active_index in indexes:
+            indexes.remove(active_index)
+            indexes.insert(0, active_index)
+
+        accounts = []
+        for account_index in indexes:
+            data_name = Storage.ComposeDataString("data", account_index)
+            data_name_key = Storage.ComputeDataNameKey(data_name)
+            file_part = Storage.ToFilePart(data_name_key)
+
+            try:
+                mtp = Storage.ReadEncryptedFile(file_part, tdata_path, local_key)
+                block_id = mtp.stream.readInt32()
+                if block_id != 75:
+                    continue
+
+                serialized = QByteArray()
+                mtp.stream >> serialized
+                stream = QDataStream(serialized)
+                stream.setVersion(QDataStream.Version.Qt_5_1)
+
+                user_id = stream.readInt32()
+                main_dc = stream.readInt32()
+                if ((user_id << 32) | main_dc) == int(~0):
+                    user_id = stream.readUInt64()
+                    main_dc = stream.readInt32()
+
+                keys = []
+                key_count = stream.readInt32()
+                for _ in range(max(0, key_count)):
+                    dc_id = stream.readInt32()
+                    key_bytes = bytes(stream.readRawData(256))
+                    if len(key_bytes) == 256:
+                        keys.append((dc_id, key_bytes))
+
+                destroy_count = stream.readInt32()
+                for _ in range(max(0, destroy_count)):
+                    stream.readInt32()
+                    stream.readRawData(256)
+
+                auth_key = next((key for dc_id, key in keys if dc_id == main_dc), None)
+                if not auth_key and keys:
+                    main_dc, auth_key = keys[0]
+
+                if auth_key:
+                    accounts.append({
+                        "index": account_index,
+                        "user_id": int(user_id) if user_id else None,
+                        "main_dc": int(main_dc),
+                        "auth_key": auth_key,
+                    })
+            except Exception:
+                continue
+
+        if not accounts:
+            raise RuntimeError("не удалось найти MTP auth_key внутри tdata")
+
+        return accounts
+    except Exception as e:
+        if isinstance(e, RuntimeError):
+            raise
+        raise RuntimeError(f"не удалось прочитать tdata напрямую: {normalize_opentele_error(e)}") from e
+
+def write_telethon_session_offline(output_session_path: str, account: dict):
+    dc_id = int(account.get("main_dc") or 0)
+    if dc_id not in TELEGRAM_DC_OPTIONS:
+        raise RuntimeError(f"неизвестный Telegram DC: {dc_id}")
+
+    server_address, port = TELEGRAM_DC_OPTIONS[dc_id]
+    if os.path.exists(output_session_path):
+        os.remove(output_session_path)
+
+    session = SQLiteSession(output_session_path)
+    try:
+        session.set_dc(dc_id, server_address, port)
+        session.auth_key = TelethonAuthKey(data=account["auth_key"])
+        session.save()
+    finally:
+        session.close()
+
+def convert_tdata_to_session_direct(tdata_path: str, output_session_path: str):
+    accounts = load_tdata_accounts_direct(tdata_path)
+    last_error = None
+    for account in accounts:
+        try:
+            write_telethon_session_offline(output_session_path, account)
+            return output_session_path
+        except Exception as e:
+            last_error = e
+
+    raise RuntimeError(f"не удалось записать .session: {last_error}")
+
 async def convert_tdata_to_session(tdata_path: str, output_session_path: str, verify: bool = False):
-    tdesk, UseCurrentSession = load_tdesktop_local(tdata_path)
+    try:
+        tdesk, UseCurrentSession = load_tdesktop_local(tdata_path)
+    except RuntimeError as opentele_error:
+        try:
+            return convert_tdata_to_session_direct(tdata_path, output_session_path)
+        except Exception as direct_error:
+            raise RuntimeError(
+                f"{opentele_error}; прямое чтение тоже не сработало: {direct_error}"
+            ) from direct_error
 
     try:
         client = await tdesk.ToTelethon(session=output_session_path, flag=UseCurrentSession)
@@ -614,9 +755,14 @@ async def convert_tdata_to_session(tdata_path: str, output_session_path: str, ve
     except BaseException as error:
         if os.path.exists(output_session_path):
             os.remove(output_session_path)
+        try:
+            return convert_tdata_to_session_direct(tdata_path, output_session_path)
+        except Exception:
+            pass
         raise RuntimeError(f"не удалось создать .session: {normalize_opentele_error(error)}") from error
 
     if not verify:
+        client.session.close()
         return output_session_path
 
     try:
