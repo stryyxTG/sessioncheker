@@ -12,6 +12,7 @@ import hashlib
 import importlib.util
 import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 import zipfile
@@ -101,6 +102,7 @@ class SessionStates(StatesGroup):
     waiting_for_file = State()
     waiting_for_bulk_tdata = State()
     waiting_for_bulk_sessions = State()
+    waiting_for_bulk_pyrogram = State()
     waiting_for_json = State()
     waiting_for_2fa = State()
     waiting_for_admin_id = State()
@@ -114,6 +116,25 @@ def sanitize_filename(value: str) -> str:
 def get_session_type(session_name: str) -> str:
     if session_name.startswith("tdata_"):
         return "tdata"
+
+    session_path = os.path.join(SESSION_DIR, session_name)
+    if os.path.isfile(session_path) and session_name.lower().endswith(".session"):
+        try:
+            connection = sqlite3.connect(session_path)
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(sessions)")
+            }
+            if {"server_address", "port", "auth_key"}.issubset(columns):
+                return "telethon"
+            if {"api_id", "test_mode", "user_id"}.issubset(columns):
+                return "pyrogram"
+        except sqlite3.Error:
+            pass
+        finally:
+            if "connection" in locals():
+                connection.close()
+
     if "telethon" in session_name or "json" in session_name or session_name.startswith("converted_"):
         return "telethon"
     return "pyrogram"
@@ -406,6 +427,135 @@ def build_bulk_sessions_zip(batch_id: str, converted: list[dict]):
 
     return zip_name, zip_path
 
+def read_pyrogram_session_data(session_path: str) -> dict:
+    if not os.path.isfile(session_path):
+        raise RuntimeError("Pyrogram .session file not found")
+
+    connection = None
+    try:
+        connection = sqlite3.connect(session_path)
+        connection.row_factory = sqlite3.Row
+        tables = {
+            row["name"]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        if "sessions" not in tables:
+            raise RuntimeError("sessions table not found")
+
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(sessions)")}
+        required = {"dc_id", "auth_key", "user_id"}
+        missing = sorted(required - columns)
+        if missing:
+            raise RuntimeError(f"not a Pyrogram session, missing: {', '.join(missing)}")
+
+        selected = ["dc_id", "auth_key", "user_id"]
+        for optional in ("test_mode", "api_id", "is_bot"):
+            if optional in columns:
+                selected.append(optional)
+        row = connection.execute(
+            f"SELECT {', '.join(selected)} FROM sessions LIMIT 1"
+        ).fetchone()
+        if not row:
+            raise RuntimeError("Pyrogram sessions table is empty")
+
+        auth_key = bytes(row["auth_key"] or b"")
+        dc_id = int(row["dc_id"] or 0)
+        user_id = int(row["user_id"] or 0)
+        test_mode = bool(row["test_mode"]) if "test_mode" in row.keys() else False
+        if len(auth_key) != 256:
+            raise RuntimeError(f"invalid auth_key size: {len(auth_key)}")
+        if test_mode:
+            raise RuntimeError("Telegram test-mode sessions are not supported")
+        if dc_id not in TELEGRAM_DC_OPTIONS:
+            raise RuntimeError(f"unsupported Telegram DC: {dc_id}")
+        if not user_id:
+            raise RuntimeError("user_id is missing in Pyrogram session")
+
+        return {
+            "main_dc": dc_id,
+            "dc_id": dc_id,
+            "auth_key": auth_key,
+            "user_id": user_id,
+            "api_id": int(row["api_id"] or 0) if "api_id" in row.keys() else None,
+            "is_bot": bool(row["is_bot"]) if "is_bot" in row.keys() else False,
+        }
+    except sqlite3.Error as e:
+        raise RuntimeError(f"invalid Pyrogram SQLite session: {e}") from e
+    finally:
+        if connection is not None:
+            connection.close()
+
+def load_json_object(json_path: str | None) -> dict:
+    if not json_path or not os.path.isfile(json_path):
+        return {}
+    try:
+        with open(json_path, "r", encoding="utf-8-sig") as file:
+            value = json.load(file)
+    except (OSError, UnicodeError, json.JSONDecodeError) as e:
+        raise RuntimeError(f"invalid JSON sidecar: {e}") from e
+    if not isinstance(value, dict):
+        raise RuntimeError("JSON sidecar must contain an object")
+    return value
+
+def build_telethon_json(source: dict, session_data: dict, session_name: str) -> dict:
+    result = dict(source)
+    api_id = result.get("api_id") or result.get("app_id") or session_data.get("api_id") or API_ID
+    api_hash = result.get("api_hash") or result.get("app_hash") or API_HASH
+    result.update({
+        "session_file": session_name,
+        "session_name": session_name,
+        "session_type": "telethon",
+        "user_id": session_data["user_id"],
+        "dc_id": session_data["dc_id"],
+        "api_id": int(api_id),
+        "api_hash": str(api_hash),
+        "app_id": int(api_id),
+        "app_hash": str(api_hash),
+    })
+    if "is_bot" not in result:
+        result["is_bot"] = session_data.get("is_bot", False)
+    return result
+
+def build_bulk_telethon_json_zip(batch_id: str, converted: list[dict]):
+    zip_name = f"{sanitize_filename(batch_id)}_telethon.zip"
+    zip_path = os.path.join(SESSION_DIR, zip_name)
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for result in converted:
+            for key in ("session_path", "json_path"):
+                source_path = result.get(key)
+                if source_path and os.path.isfile(source_path):
+                    archive.write(source_path, os.path.join("sessions", os.path.basename(source_path)))
+    return zip_name, zip_path
+
+def build_bulk_telethon_report_zip(batch_id: str, converted: list[dict], errors: list[dict]):
+    zip_name, zip_path = build_bulk_telethon_json_zip(batch_id, converted)
+    manifest = {
+        "converted": len(converted),
+        "errors": len(errors),
+        "files": [
+            {
+                "session": result.get("session_name"),
+                "json": result.get("json_name"),
+                "user_id": result.get("user_id"),
+            }
+            for result in converted
+        ],
+    }
+    with zipfile.ZipFile(zip_path, "a", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+        )
+        if errors:
+            archive.writestr(
+                "errors.json",
+                json.dumps(errors, ensure_ascii=False, indent=2),
+            )
+    return zip_name, zip_path
+
 def delete_local_account(session_name: str):
     path = os.path.join(SESSION_DIR, session_name)
     if os.path.isdir(path):
@@ -437,6 +587,131 @@ def safe_extract_zip(zip_path: str, destination: str):
             with archive.open(member) as source, open(member_path, "wb") as target:
                 shutil.copyfileobj(source, target, length=1024 * 1024)
 
+
+def json_sidecar_references_session(data: dict, session_path: str) -> bool:
+    session_file = os.path.basename(session_path).lower()
+    session_stem = os.path.splitext(session_file)[0]
+    for key in ("session_file", "session_name", "session", "file"):
+        value = data.get(key)
+        if not isinstance(value, str):
+            continue
+        referenced = os.path.basename(value.replace("\\", "/")).lower()
+        if referenced == session_file or os.path.splitext(referenced)[0] == session_stem:
+            return True
+    return False
+
+async def save_bulk_pyrogram_document(message: types.Message, batch_id: str, start_index: int) -> dict:
+    original_name = message.document.file_name or "pyrogram.session"
+    extension = os.path.splitext(original_name)[1].lower()
+    if extension not in {".session", ".zip"}:
+        raise ValueError("\u041d\u0443\u0436\u0435\u043d Pyrogram .session \u0438\u043b\u0438 zip-\u0430\u0440\u0445\u0438\u0432")
+
+    work_id = hashlib.sha1(
+        f"{message.document.file_unique_id}:{batch_id}:{start_index}".encode()
+    ).hexdigest()[:12]
+    work_dir = os.path.join(SESSION_DIR, f"_pyrogram_upload_{work_id}")
+    download_path = os.path.join(work_dir, f"upload{extension}")
+    extract_dir = os.path.join(work_dir, "extract")
+    saved = []
+    errors = []
+
+    if os.path.exists(work_dir):
+        shutil.rmtree(work_dir)
+    os.makedirs(work_dir, exist_ok=True)
+
+    try:
+        telegram_file = await bot.get_file(message.document.file_id)
+        await bot.download_file(telegram_file.file_path, download_path)
+        if not os.path.isfile(download_path) or os.path.getsize(download_path) == 0:
+            raise RuntimeError("Telegram \u0441\u043a\u0430\u0447\u0430\u043b \u043f\u0443\u0441\u0442\u043e\u0439 \u0444\u0430\u0439\u043b")
+
+        if extension == ".zip":
+            os.makedirs(extract_dir, exist_ok=True)
+            safe_extract_zip(download_path, extract_dir)
+            session_paths = []
+            json_paths = []
+            for root, _, files in os.walk(extract_dir):
+                for file_name in files:
+                    full_path = os.path.join(root, file_name)
+                    if file_name.lower().endswith(".session"):
+                        session_paths.append(full_path)
+                    elif file_name.lower().endswith(".json"):
+                        json_paths.append(full_path)
+            session_paths.sort(key=lambda path: os.path.relpath(path, extract_dir).lower())
+            if not session_paths:
+                raise ValueError("\u0412 \u0430\u0440\u0445\u0438\u0432\u0435 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u043e .session \u0444\u0430\u0439\u043b\u043e\u0432")
+        else:
+            session_paths = [download_path]
+            json_paths = []
+
+        parsed_json = []
+        for json_path in json_paths:
+            try:
+                parsed_json.append((json_path, load_json_object(json_path)))
+            except Exception as e:
+                errors.append({
+                    "file": os.path.relpath(json_path, extract_dir),
+                    "error": str(e),
+                })
+
+        used_json = set()
+        for source_path in session_paths:
+            relative_name = (
+                os.path.relpath(source_path, extract_dir)
+                if extension == ".zip"
+                else original_name
+            )
+            source_base = sanitize_filename(
+                os.path.splitext(os.path.basename(relative_name))[0]
+            )[:90] or f"account_{start_index + len(saved) + 1}"
+
+            try:
+                session_data = read_pyrogram_session_data(source_path)
+                session_dir = os.path.dirname(source_path)
+                session_stem = os.path.splitext(os.path.basename(source_path))[0].lower()
+                available = [entry for entry in parsed_json if entry[0] not in used_json]
+                sidecar = next((
+                    entry for entry in available
+                    if os.path.dirname(entry[0]) == session_dir
+                    and os.path.splitext(os.path.basename(entry[0]))[0].lower() == session_stem
+                ), None)
+                if sidecar is None:
+                    sidecar = next((
+                        entry for entry in available
+                        if json_sidecar_references_session(entry[1], source_path)
+                    ), None)
+                if sidecar is None:
+                    same_dir_json = [entry for entry in available if os.path.dirname(entry[0]) == session_dir]
+                    same_dir_sessions = [path for path in session_paths if os.path.dirname(path) == session_dir]
+                    if len(same_dir_json) == 1 and len(same_dir_sessions) == 1:
+                        sidecar = same_dir_json[0]
+
+                source_json = sidecar[1] if sidecar else {}
+                if sidecar:
+                    used_json.add(sidecar[0])
+
+                item_index = start_index + len(saved) + 1
+                session_name = f"pyrogram_{batch_id}_{item_index}_{source_base}.session"
+                target_path = os.path.join(SESSION_DIR, session_name)
+                shutil.copy2(source_path, target_path)
+                update_history(session_name, {
+                    "source_base": source_base,
+                    "source_archive": original_name if extension == ".zip" else None,
+                    "source_path": relative_name,
+                    "user_id": session_data["user_id"],
+                })
+                saved.append({
+                    "session_name": session_name,
+                    "source_base": source_base,
+                    "source_json": source_json,
+                })
+            except Exception as e:
+                errors.append({"file": relative_name, "error": str(e)})
+
+        return {"saved": saved, "errors": errors}
+    finally:
+        if os.path.exists(work_dir):
+            shutil.rmtree(work_dir)
 def find_tdata_paths(root_path: str):
     found = []
     for current_root, dirs, files in os.walk(root_path):
@@ -827,6 +1102,55 @@ async def convert_tdata_account(tdata_name: str):
         "user_id": info.get("user_id") if info else None,
     }
 
+
+def convert_pyrogram_item_to_telethon(item: dict) -> dict:
+    source_name = item["session_name"]
+    source_path = os.path.join(SESSION_DIR, source_name)
+    session_data = read_pyrogram_session_data(source_path)
+    source_base = sanitize_filename(item.get("source_base") or "account") or "account"
+
+    output_base = source_base
+    output_name = f"{output_base}.session"
+    output_path = os.path.join(SESSION_DIR, output_name)
+    suffix = 2
+    while os.path.exists(output_path):
+        output_name = f"{source_base}_{suffix}.session"
+        output_path = os.path.join(SESSION_DIR, output_name)
+        suffix += 1
+
+    json_name = f"{os.path.splitext(output_name)[0]}.json"
+    json_path = os.path.join(SESSION_DIR, json_name)
+    write_telethon_session_offline(output_path, session_data)
+    try:
+        telethon_json = build_telethon_json(
+            item.get("source_json") or {},
+            session_data,
+            output_name,
+        )
+        telethon_json["test_mode"] = False
+        with open(json_path, "w", encoding="utf-8") as file:
+            json.dump(telethon_json, file, ensure_ascii=False, indent=2)
+    except Exception:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        raise
+
+    phone = telethon_json.get("phone") or telethon_json.get("phone_number")
+    update_history(output_name, {
+        "source_base": os.path.splitext(output_name)[0],
+        "user_id": session_data["user_id"],
+        "phone": phone,
+    })
+    return {
+        "source_name": source_name,
+        "session_name": output_name,
+        "session_path": output_path,
+        "json_name": json_name,
+        "json_path": json_path,
+        "user_id": session_data["user_id"],
+        "phone": phone,
+    }
+
 async def convert_session_to_tdata(session_name: str):
     TDesktop, UseCurrentSession = load_opentele()
     info = load_history().get(session_name, {})
@@ -1120,6 +1444,7 @@ async def add_session_menu(callback: types.CallbackQuery):
     builder.row(types.InlineKeyboardButton(text="Telegram Desktop tdata (.zip)", callback_data="add_type_tdata"))
     builder.row(types.InlineKeyboardButton(text="Массовая tdata (.zip)", callback_data="add_type_bulk_tdata"))
     builder.row(types.InlineKeyboardButton(text="Массовые Telethon (.session)", callback_data="add_type_bulk_sessions"))
+    builder.row(types.InlineKeyboardButton(text="\u041c\u0430\u0441\u0441\u043e\u0432\u044b\u0435 Pyrogram -> Telethon", callback_data="add_type_bulk_pyrogram"))
     builder.row(types.InlineKeyboardButton(text="JSON / String", callback_data="add_type_json"))
     builder.row(types.InlineKeyboardButton(text="Назад", callback_data="back_to_main"))
     
@@ -1167,6 +1492,26 @@ async def process_add_type(callback: types.CallbackQuery, state: FSMContext):
             reply_markup=builder.as_markup()
         )
         await state.set_state(SessionStates.waiting_for_bulk_sessions)
+    elif session_type == "bulk_pyrogram":
+        batch_id = f"bulk_pyrogram_{callback.from_user.id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        await state.update_data(
+            batch_id=batch_id,
+            bulk_items=[],
+            bulk_errors=[],
+            created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        builder = InlineKeyboardBuilder()
+        builder.row(types.InlineKeyboardButton(
+            text="\u041a\u043e\u043d\u0432\u0435\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0432\u0441\u0451",
+            callback_data=f"finish_bulk_pyrogram:{batch_id}",
+        ))
+        builder.row(types.InlineKeyboardButton(text="\u041e\u0442\u043c\u0435\u043d\u0430", callback_data="back_to_main"))
+        await callback.message.answer(
+            "\u041e\u0442\u043f\u0440\u0430\u0432\u043b\u044f\u0439\u0442\u0435 Pyrogram .session \u0438\u043b\u0438 zip-\u0430\u0440\u0445\u0438\u0432\u044b \u0441 .session \u0438 JSON. "
+            "\u041c\u043e\u0436\u043d\u043e \u043f\u0440\u0438\u0441\u043b\u0430\u0442\u044c \u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e \u0444\u0430\u0439\u043b\u043e\u0432. \u041a\u043e\u0433\u0434\u0430 \u0437\u0430\u043a\u043e\u043d\u0447\u0438\u0442\u0435, \u043d\u0430\u0436\u043c\u0438\u0442\u0435 \u043a\u043d\u043e\u043f\u043a\u0443 \u043a\u043e\u043d\u0432\u0435\u0440\u0442\u0430\u0446\u0438\u0438.",
+            reply_markup=builder.as_markup(),
+        )
+        await state.set_state(SessionStates.waiting_for_bulk_pyrogram)
     elif session_type == "tdata":
         await callback.message.answer("Отправьте .zip архив с папкой tdata или ее содержимым:")
         await state.set_state(SessionStates.waiting_for_file)
@@ -1301,6 +1646,44 @@ async def handle_bulk_session_file(message: types.Message, state: FSMContext):
     await message.answer(
         f"Добавлено .session: {len(items)}\nОшибок при загрузке: {len(errors)}",
         reply_markup=builder.as_markup()
+    )
+
+
+@router.message(SessionStates.waiting_for_bulk_pyrogram, F.document)
+async def handle_bulk_pyrogram_file(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    batch_id = data.get("batch_id")
+    items = data.get("bulk_items", [])
+    errors = data.get("bulk_errors", [])
+
+    try:
+        result = await save_bulk_pyrogram_document(message, batch_id, len(items))
+        new_items = result["saved"]
+        items.extend(new_items)
+        errors.extend(result["errors"])
+        await state.update_data(bulk_items=items, bulk_errors=errors)
+    except Exception as e:
+        errors.append({
+            "file": message.document.file_name or "unknown",
+            "error": str(e),
+        })
+        await state.update_data(bulk_errors=errors)
+        await message.answer(f"\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043e\u0431\u0440\u0430\u0431\u043e\u0442\u0430\u0442\u044c \u0444\u0430\u0439\u043b: {e}")
+        return
+
+    matched_json = sum(1 for item in new_items if item.get("source_json"))
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(
+        text="\u041a\u043e\u043d\u0432\u0435\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0432\u0441\u0451",
+        callback_data=f"finish_bulk_pyrogram:{batch_id}",
+    ))
+    builder.row(types.InlineKeyboardButton(text="\u041e\u0442\u043c\u0435\u043d\u0430", callback_data="back_to_main"))
+    await message.answer(
+        f"\u0414\u043e\u0431\u0430\u0432\u043b\u0435\u043d\u043e \u0438\u0437 \u0444\u0430\u0439\u043b\u0430: {len(new_items)}\n"
+        f"JSON \u0441\u043e\u043f\u043e\u0441\u0442\u0430\u0432\u043b\u0435\u043d\u043e: {matched_json}\n"
+        f"\u0412\u0441\u0435\u0433\u043e \u0432 \u043e\u0447\u0435\u0440\u0435\u0434\u0438: {len(items)}\n"
+        f"\u041e\u0448\u0438\u0431\u043e\u043a \u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0438: {len(errors)}",
+        reply_markup=builder.as_markup(),
     )
 
 @router.message(SessionStates.waiting_for_json)
@@ -1559,6 +1942,92 @@ async def action_get_bulk_sessions(callback: types.CallbackQuery):
         caption=f"Архив с .session: {len(converted)} аккаунтов"
     )
     await callback.message.answer("Архив с сессиями отправлен.")
+
+
+@router.callback_query(F.data.startswith("finish_bulk_pyrogram:"))
+async def action_finish_bulk_pyrogram(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    batch_id = callback.data.split(":", 1)[1]
+    if data.get("batch_id") != batch_id:
+        await callback.answer("\u041f\u0430\u0447\u043a\u0430 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u0430 \u0438\u043b\u0438 \u0443\u0436\u0435 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0430", show_alert=True)
+        return
+
+    items = data.get("bulk_items", [])
+    upload_errors = data.get("bulk_errors", [])
+    if not items:
+        await callback.answer("\u0421\u043d\u0430\u0447\u0430\u043b\u0430 \u043e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 Pyrogram-\u0441\u0435\u0441\u0441\u0438\u0438", show_alert=True)
+        return
+
+    await callback.answer("\u041a\u043e\u043d\u0432\u0435\u0440\u0442\u0430\u0446\u0438\u044f \u0437\u0430\u043f\u0443\u0449\u0435\u043d\u0430")
+    progress = await callback.message.answer(
+        f"\u041e\u0431\u0440\u0430\u0431\u043e\u0442\u0430\u043d\u043e: 0/{len(items)}\n\u0423\u0441\u043f\u0435\u0448\u043d\u043e: 0\n\u041e\u0448\u0438\u0431\u043e\u043a: 0"
+    )
+    converted = []
+    convert_errors = []
+    for index, item in enumerate(items, start=1):
+        try:
+            converted.append(convert_pyrogram_item_to_telethon(item))
+        except Exception as e:
+            convert_errors.append({
+                "session": item.get("session_name"),
+                "error": str(e),
+            })
+
+        if index % 25 == 0 or index == len(items):
+            await progress.edit_text(
+                f"\u041e\u0431\u0440\u0430\u0431\u043e\u0442\u0430\u043d\u043e: {index}/{len(items)}\n"
+                f"\u0423\u0441\u043f\u0435\u0448\u043d\u043e: {len(converted)}\n"
+                f"\u041e\u0448\u0438\u0431\u043e\u043a: {len(convert_errors)}"
+            )
+
+    batches = load_batches()
+    batches[batch_id] = {
+        "kind": "pyrogram_to_telethon",
+        "created_at": data.get("created_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source_count": len(items),
+        "upload_errors": upload_errors,
+        "converted": converted,
+        "convert_errors": convert_errors,
+    }
+    save_batches(batches)
+    await state.clear()
+
+    builder = InlineKeyboardBuilder()
+    if converted:
+        builder.row(types.InlineKeyboardButton(
+            text="\u041f\u043e\u043b\u0443\u0447\u0438\u0442\u044c Telethon + JSON",
+            callback_data=f"get_bulk_pyrogram:{batch_id}",
+        ))
+    builder.row(types.InlineKeyboardButton(text="\u0412 \u043c\u0435\u043d\u044e", callback_data="back_to_main"))
+    await callback.message.answer(
+        "\u041c\u0430\u0441\u0441\u043e\u0432\u0430\u044f \u043a\u043e\u043d\u0432\u0435\u0440\u0442\u0430\u0446\u0438\u044f Pyrogram -> Telethon \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0430\n\n"
+        f"\u0412\u0441\u0435\u0433\u043e: {len(items)}\n"
+        f"\u0423\u0441\u043f\u0435\u0448\u043d\u043e: {len(converted)}\n"
+        f"\u041e\u0448\u0438\u0431\u043e\u043a \u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0438: {len(upload_errors)}\n"
+        f"\u041e\u0448\u0438\u0431\u043e\u043a \u043a\u043e\u043d\u0432\u0435\u0440\u0442\u0430\u0446\u0438\u0438: {len(convert_errors)}",
+        reply_markup=builder.as_markup(),
+    )
+
+@router.callback_query(F.data.startswith("get_bulk_pyrogram:"))
+async def action_get_bulk_pyrogram(callback: types.CallbackQuery):
+    batch_id = callback.data.split(":", 1)[1]
+    batch = load_batches().get(batch_id)
+    if not batch or not batch.get("converted"):
+        await callback.answer("\u0413\u043e\u0442\u043e\u0432\u044b\u0435 \u0444\u0430\u0439\u043b\u044b \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u044b", show_alert=True)
+        return
+
+    await callback.answer("\u0421\u043e\u0431\u0438\u0440\u0430\u044e \u0430\u0440\u0445\u0438\u0432")
+    all_errors = batch.get("upload_errors", []) + batch.get("convert_errors", [])
+    zip_name, zip_path = build_bulk_telethon_report_zip(
+        batch_id,
+        batch["converted"],
+        all_errors,
+    )
+    await callback.message.answer_document(
+        types.FSInputFile(zip_path, filename=zip_name),
+        caption=f"Telethon .session + JSON: {len(batch['converted'])}",
+    )
 
 @router.callback_query(F.data.startswith("finish_bulk_sessions:"))
 async def action_finish_bulk_sessions(callback: types.CallbackQuery, state: FSMContext):
